@@ -809,14 +809,21 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
     }
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
     let maxt = g.max_vertex_count.saturating_sub(2).max(1);
-    let i32 = lw.s.m.i32();
-    let arr = lw.s.m.array(maxt as u64, i32);
-    let tri = lw.s.m.alloca(arr, 4);
+    use super::lower_geom::StripTriangles;
+    let tri = if maxt == 1 {
+        let var = lw.tmp_var();
+        lw.wr(var, zero);
+        StripTriangles::Single(var)
+    } else {
+        let i32 = lw.s.m.i32();
+        let arr = lw.s.m.array(maxt as u64, i32);
+        StripTriangles::Array { slots: lw.s.m.alloca(arr, 4), capacity: maxt }
+    };
     let (emitted, strip, ntri, base) = (lw.tmp_var(), lw.tmp_var(), lw.tmp_var(), lw.tmp_var());
     for v in [emitted, strip, ntri] {
         lw.wr(v, zero);
     }
     let none = lw.c(u32::MAX);
     lw.wr(base, none);
-    lw.geom = Some(super::lower_geom::GeomCtx { g: g.clone(), emitted, strip, ntri, base, tri, maxt, rec });
+    lw.geom = Some(super::lower_geom::GeomCtx { g: g.clone(), emitted, strip, ntri, base, tri, rec });
 }

@@ -5,8 +5,8 @@
 //! record per group into `res` (drawn by the pass-through mesh shader).
 //!
 //! Per lane: `emitted` / `strip` / `ntri` counters, the lowest LDS address the
-//! GS phase wrote (where its output vertices are), and the strip triangles
-//! (`[maxt x i32]` in a local array). The split wave64 form runs the ES in both
+//! GS phase wrote (where its output vertices are), and the strip triangles.
+//! The split wave64 form runs the ES in both
 //! hardware waves, then the GS in the lower one alone with fresh registers.
 
 use super::lower::{Lw, Partner};
@@ -15,15 +15,20 @@ use super::ops::WaveOp;
 use crate::gpu::rdna2::{self, Decoded};
 use crate::gpu::recomp::{ranked, GsInterface, MESH_HEADER};
 
+/// Packed strip triangles (k0 | k1 << 10 | k2 << 20) per lane.
+#[derive(Clone, Copy)]
+pub enum StripTriangles {
+    Single(u32), // SSA variable for a strip with room for one triangle
+    Array { slots: Value, capacity: u32 },
+}
+
 pub struct GeomCtx {
     pub g: GsInterface,
     pub emitted: u32,
     pub strip: u32,
     pub ntri: u32,
     pub base: u32,
-    /// local `[maxt x i32]` of strip triangles (k0 | k1 << 10 | k2 << 20)
-    pub tri: Value,
-    pub maxt: u32,
+    pub tri: StripTriangles,
     pub rec: Value,
 }
 
@@ -55,9 +60,9 @@ impl Lw {
     }
 
     fn gs_emit_cut(&mut self, op: u64) {
-        let (ve, vs, vn, tri, maxt) = {
+        let (ve, vs, vn, tri) = {
             let g = self.geom.as_ref().expect("geometry");
-            (g.emitted, g.strip, g.ntri, g.tri, g.maxt)
+            (g.emitted, g.strip, g.ntri, g.tri)
         };
         let act = self.act();
         if op & 2 != 0 {
@@ -66,7 +71,11 @@ impl Lw {
             let strip = self.rd(vs);
             let ntri = self.rd(vn);
             let two = self.cmpc(Pred::UGe, strip, 2);
-            let room = self.cmpc(Pred::ULt, ntri, maxt);
+            let capacity = match tri {
+                StripTriangles::Single(_) => 1,
+                StripTriangles::Array { capacity, .. } => capacity,
+            };
+            let room = self.cmpc(Pred::ULt, ntri, capacity);
             let c = self.land(act, two);
             let c = self.land(c, room);
             let k1 = self.c(1);
@@ -83,13 +92,22 @@ impl Lw {
             let par = self.andc(strip, 1);
             let ev = self.cmpc(Pred::Eq, par, 0);
             let val = self.sel(ev, even, odd);
-            let last = self.c(maxt - 1);
-            let idx = self.umin(ntri, last);
-            let zero = self.c(0);
-            let p = self.s.m.gep(tri, &[zero, idx]);
-            let old = self.s.m.load(p, 4);
-            let nv = self.sel(c, val, old);
-            self.s.m.store(p, nv, 4);
+            match tri {
+                StripTriangles::Single(var) => {
+                    let old = self.rd(var);
+                    let next = self.sel(c, val, old);
+                    self.wr(var, next);
+                }
+                StripTriangles::Array { slots, capacity } => {
+                    let last = self.c(capacity - 1);
+                    let idx = self.umin(ntri, last);
+                    let zero = self.c(0);
+                    let p = self.s.m.gep(slots, &[zero, idx]);
+                    let old = self.s.m.load(p, 4);
+                    let nv = self.sel(c, val, old);
+                    self.s.m.store(p, nv, 4);
+                }
+            }
             let n1 = self.addc(ntri, 1);
             let n = self.sel(c, n1, ntri);
             self.wr(vn, n);
@@ -141,9 +159,12 @@ impl Lw {
         let z = self.c(0);
         self.wr(super::lower::VAR_SCC, z);
         let g = self.geom.as_ref().expect("geometry");
-        let (ve, vs, vn, vb) = (g.emitted, g.strip, g.ntri, g.base);
+        let (ve, vs, vn, vb, tri) = (g.emitted, g.strip, g.ntri, g.base, g.tri);
         for v in [ve, vs, vn] {
             self.wr(v, z);
+        }
+        if let StripTriangles::Single(var) = tri {
+            self.wr(var, z);
         }
         let m = self.c(u32::MAX);
         self.wr(vb, m);
@@ -215,16 +236,8 @@ impl Lw {
             }
         });
         // triangles: j < ntri, tb + j < maxp
-        let pmax = self.c(maxp);
-        let left = self.sub(pmax, tb);
-        let room = self.cmp(Pred::UGt, pmax, tb);
-        let left = self.sel(room, left, z);
-        let n = self.umin(ntri, left);
         let prim_base = (MESH_HEADER + maxv as usize * vd as usize) as u32;
-        self.counted_loop(n, &mut |lw, j| {
-            let zero = lw.c(0);
-            let p = lw.s.m.gep(tri, &[zero, j]);
-            let t = lw.s.m.load(p, 4);
+        let emit = |lw: &mut Lw, j, t| {
             let a = lw.andc(t, 0x3FF);
             let a = lw.add(a, vb);
             let b = lw.lshrc(t, 10);
@@ -242,7 +255,32 @@ impl Lw {
             let o = lw.add(o, j);
             let o = lw.shlc(o, 2);
             lw.s.raw_store(res, o, &[v]);
-        });
+        };
+        match tri {
+            StripTriangles::Single(var) => {
+                let room = self.cmpc(Pred::ULt, tb, maxp);
+                let has_triangle = self.cmpc(Pred::Ne, ntri, 0);
+                let write = self.land(room, has_triangle);
+                let _ = self.guarded(write, &mut |lw| {
+                    let t = lw.rd(var);
+                    emit(lw, z, t);
+                    Ok(())
+                });
+            }
+            StripTriangles::Array { slots, .. } => {
+                let pmax = self.c(maxp);
+                let left = self.sub(pmax, tb);
+                let room = self.cmp(Pred::UGt, pmax, tb);
+                let left = self.sel(room, left, z);
+                let n = self.umin(ntri, left);
+                self.counted_loop(n, &mut |lw, j| {
+                    let zero = lw.c(0);
+                    let p = lw.s.m.gep(slots, &[zero, j]);
+                    let t = lw.s.m.load(p, 4);
+                    emit(lw, j, t);
+                });
+            }
+        }
     }
 
     /// `for (k = 0; k < n; k++) body(k)` with a real loop (the counter in an SSA variable).
