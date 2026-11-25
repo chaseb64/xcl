@@ -2,7 +2,7 @@ name: XCL Windows validation
 
 on:
   push:
-    branches: [validation/windows-msvc]
+    branches: [validation/windows-msvc-recovery]
 
 permissions:
   contents: read
@@ -43,15 +43,11 @@ jobs:
         timeout-minutes: 5
         run: ./scripts/windows-validation/probe.ps1
 
-      - name: Build and test baseline
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        timeout-minutes: 35
-        run: ./scripts/windows-validation/validate.ps1 -Role baseline
-
-      - name: Build and test candidate
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        timeout-minutes: 35
-        run: ./scripts/windows-validation/validate.ps1 -Role candidate
+      - name: Trigger the artifact recovery control
+        run: |
+          'expected_failure=artifact-recovery-control' |
+            Set-Content -LiteralPath "$env:EVIDENCE/recovery-control.txt"
+          throw 'Intentional check failure to verify Actions artifact recovery.'
 
       - name: Upload validation evidence
         if: always()
